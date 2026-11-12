@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type FormEvent } from 'react';
+import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 
 type Page = 'home' | 'payment' | 'visit' | 'map';
@@ -9,7 +9,7 @@ type Restaurant = {
   latitude: number | null;
   longitude: number | null;
 };
-type DishDraft = { key: number; name: string; price: string; rating: string };
+type DishDraft = { key: number; name: string; price: string; rating: string; photo: File | null };
 type AppDatabase = {
   public: {
     Tables: {};
@@ -33,7 +33,7 @@ type AppDatabase = {
           p_new_restaurant_name: string | null;
           p_new_restaurant_address: string | null;
           p_submitted_name: string | null;
-          p_dishes: { name: string; price: number; rating: number }[];
+          p_dishes: { name: string; price: number; rating: number; photo_path: string | null }[];
         };
         Returns: number;
       };
@@ -41,6 +41,30 @@ type AppDatabase = {
   };
 };
 let supabaseClient: SupabaseClient<AppDatabase> | undefined;
+let turnstileScriptPromise: Promise<void> | undefined;
+
+const MAX_SOURCE_PHOTO_BYTES = 15 * 1024 * 1024;
+const MAX_COMPRESSED_PHOTO_BYTES = 1_000_000;
+
+type TurnstileApi = {
+  render: (
+    container: HTMLElement,
+    options: {
+      sitekey: string;
+      action: string;
+      callback: (token: string) => void;
+      'expired-callback': () => void;
+      'error-callback': () => void;
+    },
+  ) => string;
+  remove: (widgetId: string) => void;
+};
+
+declare global {
+  interface Window {
+    turnstile?: TurnstileApi;
+  }
+}
 
 type RestaurantFieldsProps = {
   restaurants: Restaurant[];
@@ -70,6 +94,134 @@ function errorMessage(error: unknown) {
     return error.message;
   }
   return 'Please try again.';
+}
+
+function loadTurnstileScript() {
+  if (window.turnstile) return Promise.resolve();
+  if (turnstileScriptPromise) return turnstileScriptPromise;
+
+  turnstileScriptPromise = new Promise<void>((resolve, reject) => {
+    let script = document.querySelector<HTMLScriptElement>('script[data-turnstile-script]');
+    if (!script) {
+      script = document.createElement('script');
+      script.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
+      script.async = true;
+      script.defer = true;
+      script.dataset.turnstileScript = 'true';
+      document.head.append(script);
+    }
+
+    script.addEventListener('load', () => {
+      if (window.turnstile) resolve();
+      else {
+        script?.remove();
+        reject(new Error('The human check loaded without its API.'));
+      }
+    }, { once: true });
+    script.addEventListener('error', () => {
+      script?.remove();
+      reject(new Error('Could not load the human check.'));
+    }, { once: true });
+  });
+  void turnstileScriptPromise.catch(() => {
+    turnstileScriptPromise = undefined;
+  });
+  return turnstileScriptPromise;
+}
+
+function TurnstileChallenge({
+  siteKey,
+  resetKey,
+  onToken,
+  onError,
+}: {
+  siteKey: string;
+  resetKey: number;
+  onToken: (token: string) => void;
+  onError: (message: string) => void;
+}) {
+  const containerRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    let isCurrent = true;
+    let widgetId: string | undefined;
+    onToken('');
+    onError('');
+
+    void loadTurnstileScript()
+      .then(() => {
+        if (!isCurrent || !containerRef.current || !window.turnstile) return;
+        widgetId = window.turnstile.render(containerRef.current, {
+          sitekey: siteKey,
+          action: 'dish_photo_upload',
+          callback: onToken,
+          'expired-callback': () => onToken(''),
+          'error-callback': () => {
+            onToken('');
+            onError('The human check could not be completed. Please try again.');
+          },
+        });
+      })
+      .catch((error: unknown) => {
+        if (isCurrent) onError(errorMessage(error));
+      });
+
+    return () => {
+      isCurrent = false;
+      if (widgetId && window.turnstile) window.turnstile.remove(widgetId);
+    };
+  }, [siteKey, resetKey, onError, onToken]);
+
+  return <div className="turnstile-widget" ref={containerRef} />;
+}
+
+function DishPhotoPreview({ file }: { file: File }) {
+  const [previewUrl, setPreviewUrl] = useState('');
+
+  useEffect(() => {
+    const url = URL.createObjectURL(file);
+    setPreviewUrl(url);
+    return () => URL.revokeObjectURL(url);
+  }, [file]);
+
+  return previewUrl
+    ? <img className="dish-photo-preview" src={previewUrl} alt="Selected dish" />
+    : null;
+}
+
+async function compressDishPhoto(file: File) {
+  if (file.size > MAX_SOURCE_PHOTO_BYTES) {
+    throw new Error('Each selected photo must be 15 MB or smaller before resizing.');
+  }
+  if (!['image/jpeg', 'image/png', 'image/webp'].includes(file.type)) {
+    throw new Error('Choose a JPEG, PNG, or WebP photo.');
+  }
+
+  const bitmap = await createImageBitmap(file);
+  try {
+    for (const maxDimension of [1600, 1300, 1000, 800]) {
+      const scale = Math.min(1, maxDimension / Math.max(bitmap.width, bitmap.height));
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+      canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+      const context = canvas.getContext('2d');
+      if (!context) throw new Error('This browser could not prepare the photo.');
+      context.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+
+      for (const quality of [0.82, 0.7, 0.58]) {
+        const blob = await new Promise<Blob | null>((resolve) =>
+          canvas.toBlob(resolve, 'image/webp', quality));
+        if (!blob) throw new Error('This browser could not prepare the photo.');
+        if (blob.size <= MAX_COMPRESSED_PHOTO_BYTES &&
+          ['image/webp', 'image/jpeg', 'image/png'].includes(blob.type)) {
+          return blob;
+        }
+      }
+    }
+  } finally {
+    bitmap.close();
+  }
+  throw new Error('Could not reduce this photo below 1 MB. Try a smaller image.');
 }
 
 function RestaurantFields({
@@ -172,10 +324,14 @@ function App() {
   const [cashAccepted, setCashAccepted] = useState(false);
   const [cardAccepted, setCardAccepted] = useState(false);
   const [dishDrafts, setDishDrafts] = useState<DishDraft[]>([
-    { key: 0, name: '', price: '', rating: '' },
+    { key: 0, name: '', price: '', rating: '', photo: null },
   ]);
   const nextDishKey = useRef(1);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [isPreparingPhotos, setIsPreparingPhotos] = useState(false);
+  const [turnstileToken, setTurnstileToken] = useState('');
+  const [turnstileError, setTurnstileError] = useState('');
+  const [turnstileResetKey, setTurnstileResetKey] = useState(0);
   const [formMessage, setFormMessage] = useState('');
   const [formMessageIsError, setFormMessageIsError] = useState(false);
 
@@ -222,7 +378,9 @@ function App() {
     resetRestaurantFields();
     setCashAccepted(false);
     setCardAccepted(false);
-    setDishDrafts([{ key: nextDishKey.current++, name: '', price: '', rating: '' }]);
+    setDishDrafts([{ key: nextDishKey.current++, name: '', price: '', rating: '', photo: null }]);
+    setTurnstileToken('');
+    setTurnstileError('');
     setPage(nextPage);
   }
 
@@ -315,25 +473,80 @@ function App() {
       return;
     }
 
+    const hasPhotos = dishDrafts.some((dish) => dish.photo !== null);
+    if (hasPhotos && !import.meta.env.VITE_TURNSTILE_SITE_KEY) {
+      reportFormError('Photo uploads are not configured yet. Add the Turnstile site key to the app settings.');
+      return;
+    }
+    if (hasPhotos && !turnstileToken) {
+      reportFormError('Complete the human check before submitting dish photos.');
+      return;
+    }
+
     const form = event.currentTarget;
     const values = new FormData(form);
     setIsSubmitting(true);
     try {
-      const { error } = await getSupabaseClient().rpc('submit_restaurant_visit', {
-        p_restaurant_id: isAddingRestaurant ? null : selectedRestaurantId,
-        p_new_restaurant_name: isAddingRestaurant ? newRestaurantName.trim() : null,
-        p_new_restaurant_address: isAddingRestaurant ? newRestaurantAddress.trim() : null,
-        p_submitted_name: String(values.get('submitted_name') ?? '').trim() || null,
-        p_dishes: dishes,
-      });
-      if (error) throw error;
+      const submittedName = String(values.get('submitted_name') ?? '').trim() || null;
+      if (hasPhotos) {
+        setIsPreparingPhotos(true);
+        setFormMessage('Preparing dish photos…');
+        setFormMessageIsError(false);
+        const photos = await Promise.all(dishDrafts.map((dish) =>
+          dish.photo ? compressDishPhoto(dish.photo) : Promise.resolve(null)));
+        const request = new FormData();
+        request.append('turnstileToken', turnstileToken);
+        request.append('submission', JSON.stringify({
+          restaurantId: isAddingRestaurant ? null : selectedRestaurantId,
+          newRestaurantName: isAddingRestaurant ? newRestaurantName.trim() : null,
+          newRestaurantAddress: isAddingRestaurant ? newRestaurantAddress.trim() : null,
+          submittedName,
+          dishes,
+        }));
+        photos.forEach((photo, index) => {
+          if (photo) request.append(`photo_${index}`, photo, `dish-${index}.${photo.type.split('/')[1]}`);
+        });
+        setIsPreparingPhotos(false);
+        setFormMessage('Saving visit and photos…');
+
+        const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
+        const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
+        if (!supabaseUrl || !supabaseAnonKey) {
+          throw new Error('Supabase is not configured. Add the project URL and public anon key to .env.local.');
+        }
+        const response = await fetch(`${supabaseUrl.replace(/\/$/, '')}/functions/v1/submit-visit-with-photos`, {
+          method: 'POST',
+          headers: {
+            apikey: supabaseAnonKey,
+            Authorization: `Bearer ${supabaseAnonKey}`,
+          },
+          body: request,
+        });
+        const result: unknown = await response.json().catch(() => null);
+        if (!response.ok) throw new Error(errorMessage(result) || `Photo submission failed (${response.status}).`);
+      } else {
+        const { error } = await getSupabaseClient().rpc('submit_restaurant_visit', {
+          p_restaurant_id: isAddingRestaurant ? null : selectedRestaurantId,
+          p_new_restaurant_name: isAddingRestaurant ? newRestaurantName.trim() : null,
+          p_new_restaurant_address: isAddingRestaurant ? newRestaurantAddress.trim() : null,
+          p_submitted_name: submittedName,
+          p_dishes: dishes.map((dish) => ({ ...dish, photo_path: null })),
+        });
+        if (error) throw error;
+      }
 
       form.reset();
       resetRestaurantFields();
-      setDishDrafts([{ key: nextDishKey.current++, name: '', price: '', rating: '' }]);
+      setDishDrafts([{ key: nextDishKey.current++, name: '', price: '', rating: '', photo: null }]);
+      setTurnstileToken('');
+      setTurnstileError('');
+      setTurnstileResetKey((key) => key + 1);
       setFormMessage('Your visit was saved. Thanks for sharing!');
       setRestaurantListRefresh((refresh) => refresh + 1);
     } catch (error) {
+      setIsPreparingPhotos(false);
+      setTurnstileToken('');
+      setTurnstileResetKey((key) => key + 1);
       reportFormError(`Could not save the visit: ${errorMessage(error)}`);
     } finally {
       setIsSubmitting(false);
@@ -344,6 +557,18 @@ function App() {
     setDishDrafts((drafts) =>
       drafts.map((dish) => dish.key === key ? { ...dish, [field]: value } : dish));
   }
+
+  function updateDishPhoto(key: number, photo: File | null) {
+    setDishDrafts((drafts) =>
+      drafts.map((dish) => dish.key === key ? { ...dish, photo } : dish));
+    setTurnstileToken('');
+    setTurnstileError('');
+    setTurnstileResetKey((value) => value + 1);
+  }
+
+  const hasDishPhotos = dishDrafts.some((dish) => dish.photo !== null);
+  const handleTurnstileToken = useCallback((token: string) => setTurnstileToken(token), []);
+  const handleTurnstileError = useCallback((message: string) => setTurnstileError(message), []);
 
   if (page !== 'home') {
     const isPaymentPage = page === 'payment';
@@ -530,6 +755,41 @@ function App() {
                         </span>
                       </div>
                     </div>
+                    <label className="photo-field">
+                      Dish photo (optional)
+                      <input
+                        accept="image/jpeg,image/png,image/webp"
+                        capture="environment"
+                        onChange={(event) => {
+                          const file = event.currentTarget.files?.[0] ?? null;
+                          if (file && !['image/jpeg', 'image/png', 'image/webp'].includes(file.type)) {
+                            reportFormError('Choose a JPEG, PNG, or WebP photo.');
+                            event.currentTarget.value = '';
+                            return;
+                          }
+                          if (file && file.size > MAX_SOURCE_PHOTO_BYTES) {
+                            reportFormError('Each selected photo must be 15 MB or smaller before resizing.');
+                            event.currentTarget.value = '';
+                            return;
+                          }
+                          updateDishPhoto(dish.key, file);
+                        }}
+                        type="file"
+                      />
+                      <span className="photo-help">One photo per dish. It will be resized to 1600 px or less and 1 MB before upload.</span>
+                      {dish.photo && (
+                        <div className="photo-preview-row">
+                          <DishPhotoPreview file={dish.photo} />
+                          <button
+                            className="text-button"
+                            onClick={() => updateDishPhoto(dish.key, null)}
+                            type="button"
+                          >
+                            Remove photo
+                          </button>
+                        </div>
+                      )}
+                    </label>
                   </fieldset>
                 ))}
               </div>
@@ -538,7 +798,7 @@ function App() {
                   className="secondary-button add-dish-button"
                   onClick={() => setDishDrafts((drafts) => [
                     ...drafts,
-                    { key: nextDishKey.current++, name: '', price: '', rating: '' },
+                    { key: nextDishKey.current++, name: '', price: '', rating: '', photo: null },
                   ])}
                   type="button"
                 >
@@ -549,8 +809,25 @@ function App() {
                 Your name (optional)
                 <input autoComplete="name" name="submitted_name" maxLength={80} />
               </label>
+              {hasDishPhotos && (
+                <div className="human-check-field">
+                  <span className="human-check-label">Confirm you’re human to upload photos</span>
+                  {import.meta.env.VITE_TURNSTILE_SITE_KEY ? (
+                    <TurnstileChallenge
+                      key={turnstileResetKey}
+                      siteKey={import.meta.env.VITE_TURNSTILE_SITE_KEY}
+                      resetKey={turnstileResetKey}
+                      onToken={handleTurnstileToken}
+                      onError={handleTurnstileError}
+                    />
+                  ) : (
+                    <p className="photo-help" role="status">Photo uploads need a Turnstile site key configured by the site owner.</p>
+                  )}
+                  {turnstileError && <p className="form-message form-message-error" role="alert">{turnstileError}</p>}
+                </div>
+              )}
               <button className="submit-button" type="submit" disabled={isSubmitting}>
-                {isSubmitting ? 'Saving…' : 'Save visit'}
+                {isPreparingPhotos ? 'Preparing photos…' : isSubmitting ? 'Saving…' : 'Save visit'}
               </button>
               {formMessage && (
                 <p className={`form-message${formMessageIsError ? ' form-message-error' : ''}`} role={formMessageIsError ? 'alert' : 'status'}>

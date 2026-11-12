@@ -1,0 +1,4 @@
+project_id = "restaurants-vienna"
+
+[functions.submit-visit-with-photos]
+verify_jwt = false
